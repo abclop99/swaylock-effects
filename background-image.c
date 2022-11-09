@@ -32,6 +32,25 @@ void cairo_rgb24_from_xbgr32_le(unsigned char *buf, int width, int height, int s
 	}
 }
 
+// Cairo RGB24 uses 32 bits per pixel, as XRGB, in native endianness.
+// BGR888 uses 24 bits per pixel, as BGR, little endian.
+// 24-bit BGR format, [23:0] B:G:R little endian (From wayland-client-protocol.h)
+void cairo_rgb24_from_bgr888_le(unsigned char *buf, int width, int height, int stride) {
+	for (int y = 0; y < height; ++y) {
+		// Row from back to front to avoid overwriting data.
+		for (int x = width-1; x >= 0; --x) {
+			// 24 bits = 3 bytes, 32 bits = 4 bytes
+			unsigned char *srcpix = buf + y * stride + x * 3;
+			unsigned char *dstpix = buf + y * stride + x * 4;
+
+			*(uint32_t *)dstpix = 0 |
+				(uint32_t)srcpix[0] << 16 |
+				(uint32_t)srcpix[1] << 8 |
+				(uint32_t)srcpix[2];
+		}
+	}
+}
+
 enum background_mode parse_background_mode(const char *mode) {
 	if (strcmp(mode, "stretch") == 0) {
 		return BACKGROUND_MODE_STRETCH;
@@ -170,7 +189,17 @@ cairo_surface_t *load_background_from_buffer(void *buf, uint32_t format,
 				cairo_image_surface_get_height(image),
 				cairo_image_surface_get_stride(image));
 	} else {
-		if (format != WL_SHM_FORMAT_XRGB8888 && format != WL_SHM_FORMAT_ARGB8888) {
+		if (format == WL_SHM_FORMAT_BGR888) {
+			swaylock_log(LOG_INFO,
+					"Pixel format WL_SHM_FORMAT_BGR888 has not been implemented yet."
+					);
+			cairo_rgb24_from_bgr888_le(
+					cairo_image_surface_get_data(image),
+					cairo_image_surface_get_width(image),
+					cairo_image_surface_get_height(image),
+					cairo_image_surface_get_stride(image)
+					);
+		} else if (format != WL_SHM_FORMAT_XRGB8888 && format != WL_SHM_FORMAT_ARGB8888) {
 			swaylock_log(LOG_ERROR,
 					"Unknown pixel format: %u. Assuming XRGB32. Colors may look wrong.",
 					format);
