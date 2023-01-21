@@ -257,7 +257,6 @@ static void destroy_surface(struct swaylock_surface *surface) {
 	destroy_buffer(&surface->buffers[1]);
 	destroy_buffer(&surface->indicator_buffers[0]);
 	destroy_buffer(&surface->indicator_buffers[1]);
-	fade_destroy(&surface->fade);
 	wl_output_destroy(surface->output);
 	free(surface);
 }
@@ -288,19 +287,6 @@ static void create_surface(struct swaylock_surface *surface) {
 	}
 
 	surface->image = select_image(state, surface);
-
-	static bool has_printed_zxdg_error = false;
-	if (state->zxdg_output_manager) {
-		surface->xdg_output = zxdg_output_manager_v1_get_xdg_output(
-				state->zxdg_output_manager, surface->output);
-		zxdg_output_v1_add_listener(
-				surface->xdg_output, &_xdg_output_listener, surface);
-		surface->events_pending += 1;
-	} else if (!has_printed_zxdg_error) {
-		swaylock_log(LOG_INFO, "Compositor does not support zxdg output "
-				"manager, images assigned to named outputs will not work");
-		has_printed_zxdg_error = true;
-	}
 
 	surface->surface = wl_compositor_create_surface(state->compositor);
 	assert(surface->surface);
@@ -352,9 +338,10 @@ static void initially_render_surface(struct swaylock_surface *surface) {
 		wl_region_destroy(region);
 	}
 
-	render_frame_background(surface);
-	render_background_fade_prepare(surface, surface->current_buffer);
-	render_frame(surface);
+	if (!surface->state->ext_session_lock_v1) {
+		render_frame_background(surface, true);
+		render_frame(surface);
+	}
 }
 
 static void layer_surface_configure(void *data,
@@ -394,8 +381,12 @@ static void ext_session_lock_surface_v1_handle_configure(void *data,
 	surface->height = height;
 	surface->indicator_width = 0;
 	surface->indicator_height = 0;
+	// Render before we send the ACK event, so that we minimize flickering
+	// This means we cannot commit immediately after rendering -- we will have
+	// to send the ACK first and then commit.
+	render_frame_background(surface, false);
 	ext_session_lock_surface_v1_ack_configure(lock_surface, serial);
-	render_frame_background(surface);
+	wl_surface_commit(surface->surface);
 	render_frame(surface);
 }
 
@@ -641,17 +632,18 @@ static void handle_screencopy_frame_ready(void *data,
 			surface->screencopy.transform);
 	if (image == NULL) {
 		swaylock_log(LOG_ERROR, "Failed to create image from screenshot");
+		state->args.screenshots = false;
+		state->args.fade_in = 0; // Fade in is not possible without screenshot
 	} else  {
-		surface->screencopy.image->cairo_surface =
-			apply_effects(image, state, surface->scale);
-		surface->image = surface->screencopy.image->cairo_surface;
+		surface->screencopy.original_image = cairo_surface_duplicate(image);
+		surface->screencopy.image->cairo_surface = image;
+		if (state->args.screenshots) {
+			swaylock_log(LOG_DEBUG, "Loaded screenshot for output %s", surface->output_name);
+			wl_list_insert(&state->images, &surface->screencopy.image->link);
+		}
 	}
 
-	swaylock_log(LOG_DEBUG, "Loaded screenshot for output %s", surface->output_name);
-	wl_list_insert(&state->images, &surface->screencopy.image->link);
-	if (--surface->events_pending == 0) {
-		initially_render_surface(surface);
-	}
+	--surface->events_pending;
 }
 
 static void handle_screencopy_frame_failed(void *data,
@@ -659,10 +651,10 @@ static void handle_screencopy_frame_failed(void *data,
 	swaylock_trace();
 	struct swaylock_surface *surface = data;
 	swaylock_log(LOG_ERROR, "Screencopy failed");
+	surface->state->args.screenshots = false;
+	surface->state->args.fade_in = 0; // Fade in is not possible without screenshot
 
-	if (--surface->events_pending == 0) {
-		initially_render_surface(surface);
-	}
+	--surface->events_pending;
 }
 
 static const struct zwlr_screencopy_frame_v1_listener screencopy_frame_listener = {
@@ -700,33 +692,23 @@ static void handle_xdg_output_done(void *data, struct zxdg_output_v1 *output) {
 	swaylock_trace();
 	struct swaylock_surface *surface = data;
 	struct swaylock_state *state = surface->state;
-	cairo_surface_t *new_image = select_image(surface->state, surface);
 
-	if (new_image == surface->image && state->args.screenshots) {
-		static bool has_printed_screencopy_error = false;
-		if (state->screencopy_manager) {
-			surface->screencopy_frame = zwlr_screencopy_manager_v1_capture_output(
-					state->screencopy_manager, false, surface->output);
-			zwlr_screencopy_frame_v1_add_listener(surface->screencopy_frame,
-					&screencopy_frame_listener, surface);
-			surface->events_pending += 1;
-		} else if (!has_printed_screencopy_error) {
-			swaylock_log(LOG_INFO, "Compositor does not support screencopy manager, "
-					"screenshots will not work");
-			has_printed_screencopy_error = true;
-		}
-	} else if (new_image != NULL) {
-		if (state->args.screenshots) {
-			swaylock_log(LOG_DEBUG,
-					"Using existing image instead of taking a screenshot for output %s.",
-					surface->output_name);
-		}
-		surface->image = new_image;
+	static bool has_printed_screencopy_error = false;
+	if (state->screencopy_manager) {
+		surface->screencopy_frame = zwlr_screencopy_manager_v1_capture_output(
+				state->screencopy_manager, false, surface->output);
+		zwlr_screencopy_frame_v1_add_listener(surface->screencopy_frame,
+				&screencopy_frame_listener, surface);
+		surface->events_pending += 1;
+	} else if (!has_printed_screencopy_error) {
+		swaylock_log(LOG_INFO, "Compositor does not support screencopy manager, "
+				"screenshots / fade-in will not work");
+		state->args.screenshots = false;
+		state->args.fade_in = 0; // Fade in is not possible without screenshot
+		has_printed_screencopy_error = true;
 	}
 
-	if (--surface->events_pending == 0) {
-		initially_render_surface(surface);
-	}
+	--surface->events_pending;
 }
 
 struct zxdg_output_v1_listener _xdg_output_listener = {
@@ -1885,6 +1867,46 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
+	struct swaylock_surface *surface;
+	if (state.zxdg_output_manager) {
+		// Enumerate all outputs first so that screenshots can be obtained
+		// before ext_session_lock_manager_v1_lock(). After the screen is locked,
+		// no screenshot can be retrieved because normal rendering is blocked.
+		wl_list_for_each(surface, &state.surfaces, link) {
+			surface->xdg_output = zxdg_output_manager_v1_get_xdg_output(
+					state.zxdg_output_manager, surface->output);
+			zxdg_output_v1_add_listener(
+					surface->xdg_output, &_xdg_output_listener, surface);
+			surface->events_pending += 1;
+		};
+
+		wl_list_for_each(surface, &state.surfaces, link) {
+			while (surface->events_pending > 0) {
+				wl_display_roundtrip(state.display);
+			}
+		}
+	} else {
+		swaylock_log(LOG_INFO, "Compositor does not support zxdg output "
+				"manager, images assigned to named outputs will not work");
+		state.args.screenshots = false;
+		state.args.fade_in = 0; // Fade in is not possible without screenshot
+	}
+
+	// Must daemonize before we run any effects, since effects use openmp
+	int daemonfd;
+	if (state.args.daemonize) {
+		wl_display_roundtrip(state.display);
+		daemonfd = daemonize_start();
+	}
+
+	// Need to apply effects to all images *before* requesting ext_session_lock_v1
+	// Otherwise, the screen would be blank while the effects are being applied.
+	struct swaylock_image *iter_image, *temp;
+	wl_list_for_each_safe(iter_image, temp, &state.images, link) {
+		iter_image->cairo_surface = apply_effects(
+				iter_image->cairo_surface, &state, 1);
+	}
+
 	if (state.ext_session_lock_manager_v1) {
 		swaylock_log(LOG_DEBUG, "Using ext-session-lock-v1");
 		state.ext_session_lock_v1 = ext_session_lock_manager_v1_lock(state.ext_session_lock_manager_v1);
@@ -1909,21 +1931,6 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
-	// Must daemonize before we run any effects, since effects use openmp
-	int daemonfd;
-	if (state.args.daemonize) {
-		wl_display_roundtrip(state.display);
-		daemonfd = daemonize_start();
-	}
-
-	// Need to apply effects to all images loaded with --image
-	struct swaylock_image *iter_image, *temp;
-	wl_list_for_each_safe(iter_image, temp, &state.images, link) {
-		iter_image->cairo_surface = apply_effects(
-				iter_image->cairo_surface, &state, 1);
-	}
-
-	struct swaylock_surface *surface;
 	wl_list_for_each(surface, &state.surfaces, link) {
 		create_surface(surface);
 	}
